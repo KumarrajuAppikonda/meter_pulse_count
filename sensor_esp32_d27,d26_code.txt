@@ -1,0 +1,983 @@
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+
+// ============================================================
+// SENSOR POWER PIN
+// ============================================================
+//
+// GPIO27 continuously supplies HIGH to the sensor circuit.
+//
+// ============================================================
+
+#define SENSOR_POWER_PIN 27
+
+
+// ============================================================
+// SENSOR TRIGGER / PULSE INPUT
+// ============================================================
+//
+// Extra trigger wire from sensor node -> GPIO26
+//
+// GPIO26:
+//
+// Magnet away  = HIGH
+// Magnet touch = LOW
+//
+// HIGH -> LOW = one pulse
+//
+// ============================================================
+
+#define PULSE_INPUT_PIN 26
+
+
+// ============================================================
+// BLE
+// ============================================================
+
+#define BLE_DEVICE_NAME "ESP32_PULSE_METER"
+
+#define SERVICE_UUID \
+"6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
+
+#define RX_CHARACTERISTIC_UUID \
+"6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
+
+#define TX_CHARACTERISTIC_UUID \
+"6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
+
+
+// ============================================================
+// BLE OBJECTS
+// ============================================================
+
+BLEServer *pServer = nullptr;
+
+BLEService *pService = nullptr;
+
+BLECharacteristic *pRxCharacteristic = nullptr;
+
+BLECharacteristic *pTxCharacteristic = nullptr;
+
+bool deviceConnected = false;
+
+
+// ============================================================
+// METER VARIABLES
+// ============================================================
+
+volatile uint32_t pulseCount = 0;
+
+volatile unsigned long lastPulseTime = 0;
+
+
+// Initial meter reading entered by user
+uint32_t initialReading = 0;
+
+
+// Current meter reading
+uint32_t currentReading = 0;
+
+
+bool monitoring = false;
+
+
+// ============================================================
+// DEBOUNCE
+// ============================================================
+
+const unsigned long MIN_PULSE_INTERVAL_MS = 100;
+
+
+// ============================================================
+// FUNCTION DECLARATIONS
+// ============================================================
+
+void processCommand(String command);
+
+void sendBLE(String message);
+
+void sendMessage(String message);
+
+void generateStatus();
+
+
+// ============================================================
+// PULSE INTERRUPT
+// ============================================================
+//
+// GPIO26:
+//
+// Magnet away:
+// GPIO26 = HIGH
+//
+// Magnet touches:
+// GPIO26 = LOW
+//
+// HIGH -> LOW
+//      ↓
+// FALLING EDGE
+//      ↓
+// Pulse Count +1
+//
+// ============================================================
+
+void IRAM_ATTR pulseISR()
+{
+    unsigned long now = millis();
+
+    if ((now - lastPulseTime) >= MIN_PULSE_INTERVAL_MS)
+    {
+        pulseCount++;
+
+        lastPulseTime = now;
+    }
+}
+
+
+// ============================================================
+// BLE SERVER CALLBACKS
+// ============================================================
+
+class ServerCallbacks : public BLEServerCallbacks
+{
+    void onConnect(BLEServer *server)
+    {
+        deviceConnected = true;
+
+        Serial.println();
+        Serial.println("==============================");
+        Serial.println("BLE CONNECTED");
+        Serial.println("==============================");
+        Serial.println();
+
+        sendBLE("BLE CONNECTED");
+    }
+
+
+    void onDisconnect(BLEServer *server)
+    {
+        deviceConnected = false;
+
+        Serial.println();
+        Serial.println("BLE DISCONNECTED");
+        Serial.println();
+
+        delay(100);
+
+        BLEDevice::startAdvertising();
+
+        Serial.println(
+            "BLE advertising restarted."
+        );
+    }
+};
+
+
+// ============================================================
+// BLE RX CALLBACK
+// ============================================================
+//
+// Phone -> ESP32
+//
+// Examples:
+//
+// 10
+// 25
+// 100
+// READY
+// STOP
+// RESET
+// STATUS
+//
+// ============================================================
+
+class RXCallbacks : public BLECharacteristicCallbacks
+{
+    void onWrite(BLECharacteristic *characteristic)
+    {
+        String command =
+            characteristic->getValue();
+
+        command.trim();
+
+        command.toUpperCase();
+
+        if (command.length() > 0)
+        {
+            Serial.print(
+                "BLE COMMAND: "
+            );
+
+            Serial.println(command);
+
+            processCommand(command);
+        }
+    }
+};
+
+
+// ============================================================
+// SEND BLE
+// ============================================================
+
+void sendBLE(String message)
+{
+    if (deviceConnected &&
+        pTxCharacteristic != nullptr)
+    {
+        pTxCharacteristic->setValue(
+            message.c_str()
+        );
+
+        pTxCharacteristic->notify();
+    }
+}
+
+
+// ============================================================
+// SEND SERIAL + BLE
+// ============================================================
+
+void sendMessage(String message)
+{
+    Serial.println(message);
+
+    sendBLE(message);
+}
+
+
+// ============================================================
+// PROCESS COMMAND
+// ============================================================
+
+void processCommand(String command)
+{
+    command.trim();
+
+    command.toUpperCase();
+
+
+    // ========================================================
+    // NUMBER COMMAND
+    //
+    // Example:
+    //
+    // 10
+    //
+    // Means:
+    //
+    // Initial Reading = 10
+    //
+    // ========================================================
+
+    bool numberOnly = true;
+
+
+    if (command.length() == 0)
+    {
+        numberOnly = false;
+    }
+
+
+    for (int i = 0;
+         i < command.length();
+         i++)
+    {
+        if (!isDigit(command[i]))
+        {
+            numberOnly = false;
+
+            break;
+        }
+    }
+
+
+    // ========================================================
+    // SET INITIAL READING
+    // ========================================================
+
+    if (numberOnly)
+    {
+        uint32_t value =
+            command.toInt();
+
+
+        noInterrupts();
+
+        initialReading = value;
+
+        pulseCount = 0;
+
+        currentReading =
+            initialReading;
+
+        lastPulseTime = 0;
+
+        interrupts();
+
+
+        monitoring = false;
+
+
+        sendMessage(
+            "INITIAL READING SET"
+        );
+
+
+        sendMessage(
+            "Initial Reading = " +
+            String(initialReading)
+        );
+
+
+        sendMessage(
+            "Current Reading = " +
+            String(currentReading)
+        );
+
+
+        sendMessage(
+            "Send READY to start."
+        );
+
+
+        return;
+    }
+
+
+    // ========================================================
+    // READY
+    // ========================================================
+
+    if (command == "READY")
+    {
+        noInterrupts();
+
+        pulseCount = 0;
+
+        currentReading =
+            initialReading;
+
+        lastPulseTime =
+            millis();
+
+        interrupts();
+
+
+        monitoring = true;
+
+
+        sendMessage(
+            "=============================="
+        );
+
+
+        sendMessage(
+            "PULSE MONITORING STARTED"
+        );
+
+
+        sendMessage(
+            "Initial Reading = " +
+            String(initialReading)
+        );
+
+
+        sendMessage(
+            "Current Reading = " +
+            String(currentReading)
+        );
+
+
+        sendMessage(
+            "GPIO27 = SENSOR POWER"
+        );
+
+
+        sendMessage(
+            "GPIO26 = TRIGGER INPUT"
+        );
+
+
+        sendMessage(
+            "Magnet TOUCH = PULSE"
+        );
+
+
+        sendMessage(
+            "=============================="
+        );
+
+
+        return;
+    }
+
+
+    // ========================================================
+    // STOP
+    // ========================================================
+
+    if (command == "STOP")
+    {
+        monitoring = false;
+
+
+        sendMessage(
+            "PULSE MONITORING STOPPED"
+        );
+
+
+        return;
+    }
+
+
+    // ========================================================
+    // RESET
+    //
+    // Pulse count becomes 0.
+    //
+    // Initial reading remains unchanged.
+    //
+    // Example:
+    //
+    // Initial = 10
+    // RESET
+    // Reading = 10
+    //
+    // ========================================================
+
+    if (command == "RESET")
+    {
+        noInterrupts();
+
+        pulseCount = 0;
+
+        currentReading =
+            initialReading;
+
+        lastPulseTime =
+            millis();
+
+        interrupts();
+
+
+        sendMessage(
+            "PULSE COUNTER RESET"
+        );
+
+
+        sendMessage(
+            "Initial Reading = " +
+            String(initialReading)
+        );
+
+
+        sendMessage(
+            "Current Reading = " +
+            String(currentReading)
+        );
+
+
+        return;
+    }
+
+
+    // ========================================================
+    // STATUS
+    // ========================================================
+
+    if (command == "STATUS")
+    {
+        generateStatus();
+
+        return;
+    }
+
+
+    // ========================================================
+    // UNKNOWN COMMAND
+    // ========================================================
+
+    sendMessage(
+        "Unknown command."
+    );
+
+
+    sendMessage(
+        "Available commands:"
+    );
+
+
+    sendMessage(
+        "10 / 25 / 100 = Initial Reading"
+    );
+
+
+    sendMessage(
+        "READY"
+    );
+
+
+    sendMessage(
+        "STOP"
+    );
+
+
+    sendMessage(
+        "RESET"
+    );
+
+
+    sendMessage(
+        "STATUS"
+    );
+}
+
+
+// ============================================================
+// STATUS
+// ============================================================
+
+void generateStatus()
+{
+    uint32_t count;
+
+
+    noInterrupts();
+
+    count = pulseCount;
+
+    interrupts();
+
+
+    currentReading =
+        initialReading + count;
+
+
+    int triggerState =
+        digitalRead(
+            PULSE_INPUT_PIN
+        );
+
+
+    sendMessage(
+        "------------- STATUS -------------"
+    );
+
+
+    sendMessage(
+        "Initial Reading = " +
+        String(initialReading)
+    );
+
+
+    sendMessage(
+        "Pulse Count = " +
+        String(count)
+    );
+
+
+    sendMessage(
+        "Current Reading = " +
+        String(currentReading)
+    );
+
+
+    sendMessage(
+        "GPIO26 = " +
+        String(
+            triggerState
+                ? "HIGH"
+                : "LOW"
+        )
+    );
+
+
+    if (monitoring)
+    {
+        sendMessage(
+            "Monitoring = RUNNING"
+        );
+    }
+    else
+    {
+        sendMessage(
+            "Monitoring = STOPPED"
+        );
+    }
+
+
+    sendMessage(
+        "----------------------------------"
+    );
+}
+
+
+// ============================================================
+// SETUP
+// ============================================================
+
+void setup()
+{
+    // ========================================================
+    // SERIAL
+    // ========================================================
+
+    Serial.begin(115200);
+
+    delay(1000);
+
+
+    // ========================================================
+    // GPIO27
+    //
+    // SENSOR POWER
+    //
+    // GPIO27 continuously outputs HIGH.
+    //
+    // ========================================================
+
+    pinMode(
+        SENSOR_POWER_PIN,
+        OUTPUT
+    );
+
+
+    digitalWrite(
+        SENSOR_POWER_PIN,
+        HIGH
+    );
+
+
+    // ========================================================
+    // GPIO26
+    //
+    // SENSOR TRIGGER
+    //
+    // ========================================================
+
+    pinMode(
+        PULSE_INPUT_PIN,
+        INPUT
+    );
+
+
+    // ========================================================
+    // INTERRUPT
+    //
+    // HIGH -> LOW
+    //
+    // Magnet touches sensor.
+    //
+    // ========================================================
+
+    attachInterrupt(
+        digitalPinToInterrupt(
+            PULSE_INPUT_PIN
+        ),
+        pulseISR,
+        FALLING
+    );
+
+
+    // ========================================================
+    // BLE INITIALIZATION
+    // ========================================================
+
+    BLEDevice::init(
+        BLE_DEVICE_NAME
+    );
+
+
+    // ========================================================
+    // BLE SERVER
+    // ========================================================
+
+    pServer =
+        BLEDevice::createServer();
+
+
+    pServer->setCallbacks(
+        new ServerCallbacks()
+    );
+
+
+    // ========================================================
+    // BLE SERVICE
+    // ========================================================
+
+    pService =
+        pServer->createService(
+            SERVICE_UUID
+        );
+
+
+    // ========================================================
+    // TX
+    //
+    // ESP32 -> PHONE
+    // ========================================================
+
+    pTxCharacteristic =
+        pService->createCharacteristic(
+            TX_CHARACTERISTIC_UUID,
+            BLECharacteristic::PROPERTY_NOTIFY
+        );
+
+
+    pTxCharacteristic->addDescriptor(
+        new BLE2902()
+    );
+
+
+    // ========================================================
+    // RX
+    //
+    // PHONE -> ESP32
+    // ========================================================
+
+    pRxCharacteristic =
+        pService->createCharacteristic(
+            RX_CHARACTERISTIC_UUID,
+            BLECharacteristic::PROPERTY_WRITE |
+            BLECharacteristic::PROPERTY_WRITE_NR
+        );
+
+
+    pRxCharacteristic->setCallbacks(
+        new RXCallbacks()
+    );
+
+
+    // ========================================================
+    // START BLE SERVICE
+    // ========================================================
+
+    pService->start();
+
+
+    // ========================================================
+    // BLE ADVERTISING
+    // ========================================================
+
+    BLEAdvertising *advertising =
+        BLEDevice::getAdvertising();
+
+
+    advertising->addServiceUUID(
+        SERVICE_UUID
+    );
+
+
+    advertising->setScanResponse(true);
+
+    advertising->setMinPreferred(0x06);
+
+    advertising->setMinPreferred(0x12);
+
+
+    BLEDevice::startAdvertising();
+
+
+    // ========================================================
+    // STARTUP
+    // ========================================================
+
+    Serial.println();
+
+    Serial.println(
+        "========================================"
+    );
+
+
+    Serial.println(
+        "       ESP32 GAS METER PULSE"
+    );
+
+
+    Serial.println(
+        "========================================"
+    );
+
+
+    Serial.println();
+
+
+    Serial.println(
+        "GPIO27 = SENSOR POWER"
+    );
+
+
+    Serial.println(
+        "GPIO27 = HIGH"
+    );
+
+
+    Serial.println(
+        "GPIO26 = TRIGGER INPUT"
+    );
+
+
+    Serial.println(
+        "Magnet AWAY  = GPIO26 HIGH"
+    );
+
+
+    Serial.println(
+        "Magnet TOUCH = GPIO26 LOW"
+    );
+
+
+    Serial.println(
+        "HIGH -> LOW = PULSE"
+    );
+
+
+    Serial.println();
+
+
+    Serial.println(
+        "BLE advertising started."
+    );
+
+
+    Serial.println();
+
+
+    Serial.println(
+        "Commands:"
+    );
+
+
+    Serial.println(
+        "10 / 25 / 100 = Initial Reading"
+    );
+
+
+    Serial.println(
+        "READY = Start Monitoring"
+    );
+
+
+    Serial.println(
+        "STOP = Stop Monitoring"
+    );
+
+
+    Serial.println(
+        "RESET = Reset Pulse Count"
+    );
+
+
+    Serial.println(
+        "STATUS = Show Status"
+    );
+
+
+    Serial.println();
+}
+
+
+// ============================================================
+// LOOP
+// ============================================================
+
+void loop()
+{
+    // ========================================================
+    // SERIAL COMMAND
+    // ========================================================
+
+    if (Serial.available())
+    {
+        String command =
+            Serial.readStringUntil('\n');
+
+
+        command.trim();
+
+        command.toUpperCase();
+
+
+        if (command.length() > 0)
+        {
+            Serial.print(
+                "SERIAL COMMAND: "
+            );
+
+
+            Serial.println(
+                command
+            );
+
+
+            processCommand(
+                command
+            );
+        }
+    }
+
+
+    // ========================================================
+    // MONITOR PULSE COUNT
+    // ========================================================
+
+    if (monitoring)
+    {
+        uint32_t count;
+
+
+        noInterrupts();
+
+        count = pulseCount;
+
+        interrupts();
+
+
+        currentReading =
+            initialReading + count;
+
+
+        // ====================================================
+        // DETECT NEW PULSE
+        // ====================================================
+
+        static uint32_t previousCount = 0;
+
+
+        if (count != previousCount)
+        {
+            previousCount = count;
+
+
+            String message =
+                "PULSE DETECTED | ";
+
+
+            message +=
+                "Pulse Count = ";
+
+
+            message +=
+                String(count);
+
+
+            message +=
+                " | Reading = ";
+
+
+            message +=
+                String(currentReading);
+
+
+            sendMessage(
+                message
+            );
+        }
+    }
+
+
+    delay(5);
+}
